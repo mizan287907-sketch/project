@@ -1,0 +1,55 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download tools
+        run: |
+          curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+          curl -fsSL -o signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+
+      - name: Find project folder
+        id: find
+        run: |
+          f=$(find . -name apktool.yml -not -path './.git/*' | head -n 1)
+          if [ -z "$f" ]; then
+            z=$(find . -maxdepth 1 -name 'project.zip' | head -n 1)
+            if [ -n "$z" ]; then
+              mkdir -p proj
+              unzip -q "$z" -d proj
+              f=$(find proj -name apktool.yml | head -n 1)
+            fi
+          fi
+          if [ -z "$f" ]; then echo "apktool.yml not found. Upload project.zip or the project folder."; ls -R | head -50; exit 1; fi
+          d=$(dirname "$f")
+          echo "Project folder: $d"
+          echo "dir=$d" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK
+        run: java -jar apktool.jar b "${{ steps.find.outputs.dir }}" -o unsigned.apk
+
+      - name: Sign APK
+        run: |
+          java -jar signer.jar -a unsigned.apk --allowResign -o signed
+          cp signed/*.apk guard.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: guard-apk
+          path: guard.apk
