@@ -1,0 +1,92 @@
+name: Build AAB (Play Store)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'project.zip'
+
+jobs:
+  aab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download tools (apktool, bundletool)
+        run: |
+          curl -fsSL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+          curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
+
+      - name: Unzip project (no changes made to files)
+        run: |
+          mkdir -p src
+          unzip -q project.zip -d src
+          PROJ=$(dirname "$(find src -name apktool.yml | head -1)")
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+          echo "Project folder: $PROJ"
+
+      - name: Build unsigned APK with apktool
+        run: java -jar apktool.jar b "$PROJ" -o out.apk
+
+      - name: Convert APK to AAB
+        run: |
+          AAPT2=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2
+          echo "Using $AAPT2"
+          "$AAPT2" convert --output-format proto -o proto.apk out.apk
+          rm -rf conv base && mkdir -p conv base/manifest base/dex
+          unzip -q proto.apk -d conv
+          cp conv/AndroidManifest.xml base/manifest/AndroidManifest.xml
+          cp conv/resources.pb base/
+          cp conv/classes*.dex base/dex/
+          [ -d conv/res ] && cp -r conv/res base/res
+          [ -d conv/assets ] && cp -r conv/assets base/assets
+          [ -d conv/lib ] && cp -r conv/lib base/lib
+          (cd base && zip -qr ../base.zip .)
+          echo '{"compression":{"uncompressedGlob":["assets/**"]}}' > BundleConfig.json
+          java -jar bundletool.jar build-bundle --modules=base.zip --config=BundleConfig.json --output=app-unsigned.aab
+
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          mkdir -p keyout
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > keyout/upload.jks
+            echo "SIGN_PASS=$KS_PASS" >> "$GITHUB_ENV"
+            echo "SIGN_ALIAS=$KS_ALIAS" >> "$GITHUB_ENV"
+            echo "NEWKEY=no" >> "$GITHUB_ENV"
+          else
+            PASS=$(openssl rand -hex 12)
+            keytool -genkeypair -keystore keyout/upload.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" -dname "CN=Joruri Surokkha, O=Joruri, C=BD"
+            printf 'alias: upload\npassword: %s\nSAVE THIS FILE SAFELY. Use the SAME key for every future update.\n' "$PASS" > keyout/key-info.txt
+            echo "SIGN_PASS=$PASS" >> "$GITHUB_ENV"
+            echo "SIGN_ALIAS=upload" >> "$GITHUB_ENV"
+            echo "NEWKEY=yes" >> "$GITHUB_ENV"
+          fi
+
+      - name: Sign AAB
+        run: |
+          cp app-unsigned.aab app-release.aab
+          jarsigner -keystore keyout/upload.jks -storepass "$SIGN_PASS" -keypass "$SIGN_PASS" \
+            -sigalg SHA256withRSA -digestalg SHA-256 app-release.aab "$SIGN_ALIAS"
+          jarsigner -verify app-release.aab | head -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: app-release.aab
+
+      - name: Upload new key (only when generated)
+        if: env.NEWKEY == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-keystore-SAVE-THIS
+          path: keyout/
